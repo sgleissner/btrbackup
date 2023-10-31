@@ -1,0 +1,143 @@
+#!/bin/bash
+
+###################################
+# config
+###################################
+
+BACKUP_DRIVE=/backup
+
+CLIENTS=$(cat - <<-EOF
+	root@192.168.145.10:/volume1/projects
+	root@192.168.145.10:/volume1/office
+	root@192.168.145.10:/volume1/photo
+	root@192.168.145.10:/volume1/music
+	root@192.168.145.10:/volume1/homes
+	root@192.168.145.10:/volume1/diverses
+	EOF
+)
+
+#	root@192.168.145.10:/volume1/office
+#	root@192.168.145.10:/volume1/photo
+#	root@192.168.145.10:/volume1/music
+#	root@192.168.145.10:/volume1/homes
+#	root@192.168.145.10:/volume1/video
+#	root@192.168.145.10:/volume1/images
+#	root@192.168.145.10:/volume1/diverses
+
+KEY="/root/.ssh/id_ecdsa"
+
+RECEIVER="simon@gleissner.de"
+
+###################################
+# helper routines
+###################################
+
+function am_i_root() {
+	if [ "$(whoami)" != "root" ]; then
+		echo "ERROR: $0 must be started as root"
+		return 1
+	fi
+}
+
+function now() {
+	date "+%Y-%m-%d %H.%M.%S"
+}
+
+function latest() {
+	btrfs subvolume list -o "${BACKUP_DRIVE}" | sed -e "s/.*path \(.*\)/\1/" | sort | tail -n 1
+}
+
+function validate_mountpoint() {
+	if ! mountpoint -q "${BACKUP_DRIVE}"; then
+		echo "ERROR: ${BACKUP_DRIVE} is no mountpoint"
+		return 1
+	fi
+	if ! grep "${BACKUP_DRIVE}" /proc/mounts | grep -q btrfs ; then
+		echo "ERROR: ${BACKUP_DRIVE} id no btrfs filesystem"
+		return 1
+	fi
+}
+
+function validate_key() {
+	if ! test -r "${KEY}"; then
+		echo "ERROR: key ${KEY} does not exist"
+		return 1
+	fi
+}
+
+function diskfree() {
+	echo ""
+	df "${BACKUP_DRIVE}"
+}
+
+function snapshot() {
+	NOW="$(now)"
+	LATEST="$(latest)"
+	DESTINATION="${BACKUP_DRIVE}/${NOW}"
+	if [ -z "${LATEST}" ]; then
+		btrfs subvolume create "${BACKUP_DRIVE}/${NOW}"
+	else
+		btrfs subvolume snapshot "${BACKUP_DRIVE}/${LATEST}" "${BACKUP_DRIVE}/${NOW}"
+	fi
+}
+
+function snapshot_delete() {
+	btrfs subvolume delete -c "${BACKUP_DRIVE}/$1"
+}
+
+function snapshot_protect() {
+	if [ -n "${DESTINATION}" ]; then
+		echo -e "\nprotect snapshot '${DESTINATION}'"
+		find "${DESTINATION}" -maxdepth 1 -mindepth 1 -exec chmod 555 {} + || return
+		btrfs property set -ts "${DESTINATION}" ro true
+	else
+		echo "ERROR: DESTINATION is not set"
+		return 1
+	fi
+}
+
+function process_one() {
+	if [ -n "${DESTINATION}" ]; then
+		echo ""
+		echo "rsync $1"
+		rsync -a --delete --stats -e "ssh -i ${KEY}" "$1" "${DESTINATION}"
+		# TODO: Schleife, Test auf out-of-memory error, Löschen alter Snapshots
+	else
+		echo "ERROR: DESTINATION is not set"
+		return 1
+	fi
+}
+
+function process_all() {
+	while read VOLUME; do
+		process_one "${VOLUME}"
+	done <<< "${CLIENTS}"
+}
+
+function perform_backup() {
+	am_i_root			|| return
+	validate_mountpoint	|| return
+	validate_key		|| return
+	# TODO: Test auf Minimalspeicher, Löschen alter Snapshots
+	snapshot			|| return
+	diskfree			|| return
+	process_all			|| return
+	snapshot_protect	|| return
+}
+
+function backup_in_mail() {
+	LOG="$(perform_backup 2>&1)"
+	if [ $? -eq 0 ]; then
+		SUBJECT="Backup ${NOW} successful"
+	else
+		SUBJECT="Error in Backup ${NOW}"
+	fi
+	echo -ne "To: ${RECEIVER}\nContent-Type: text/plain; charset=UTF-8\nSubject: ${SUBJECT}\n\n${LOG}" | msmtp "${RECEIVER}"
+}
+
+###################################
+# main
+###################################
+
+#perform_backup
+backup_in_mail
